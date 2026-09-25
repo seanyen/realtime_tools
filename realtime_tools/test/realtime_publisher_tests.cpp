@@ -1,0 +1,126 @@
+// Copyright (c) 2019, Open Source Robotics Foundation, Inc.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+//    * Redistributions of source code must retain the above copyright
+//      notice, this list of conditions and the following disclaimer.
+//
+//    * Redistributions in binary form must reproduce the above copyright
+//      notice, this list of conditions and the following disclaimer in the
+//      documentation and/or other materials provided with the distribution.
+//
+//    * Neither the name of the Open Source Robotics Foundation, Inc. nor the names of its
+//      contributors may be used to endorse or promote products derived from
+//      this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+#include <gmock/gmock.h>
+
+#include <chrono>
+#include <memory>
+#include <mutex>
+#include <thread>
+
+#include "rclcpp/executors.hpp"
+#include "rclcpp/node.hpp"
+#include "rclcpp/utilities.hpp"
+#include "realtime_tools/realtime_publisher.hpp"
+#include "test_msgs/msg/strings.hpp"
+
+using StringMsg = test_msgs::msg::Strings;
+using realtime_tools::RealtimePublisher;
+
+struct StringCallback
+{
+  StringMsg msg_;
+  std::mutex mtx_;
+
+  void callback(const StringMsg::SharedPtr msg)
+  {
+    std::unique_lock<std::mutex> lock(mtx_);
+    msg_ = *msg;
+  }
+};
+
+void verify_publisher(
+  RealtimePublisher<StringMsg> & rt_pub, const std::shared_ptr<rclcpp::Node> & node,
+  const rclcpp::QoS & qos, const std::string & topic)
+{
+  const char * expected_msg = "Hello World";
+  ASSERT_TRUE(rt_pub.can_publish());
+
+  StringMsg msg;
+  msg.string_value = expected_msg;
+  ASSERT_TRUE(rt_pub.try_publish(msg));
+
+  // make sure subscriber gets it (created after publishing to verify transient_local latching)
+  StringCallback str_callback;
+  auto sub = node->create_subscription<StringMsg>(
+    topic, qos, std::bind(&StringCallback::callback, &str_callback, std::placeholders::_1));
+
+  rclcpp::executors::SingleThreadedExecutor exec;
+  exec.add_node(node);
+
+  auto start_time = std::chrono::steady_clock::now();
+  while (str_callback.msg_.string_value.empty() &&
+         (std::chrono::steady_clock::now() - start_time) < std::chrono::seconds(2)) {
+    exec.spin_some();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  EXPECT_STREQ(expected_msg, str_callback.msg_.string_value.c_str());
+}
+
+TEST(RealtimePublisher, rt_can_try_publish)
+{
+  rclcpp::init(0, nullptr);
+  auto node = std::make_shared<rclcpp::Node>("construct_move_destruct");
+  rclcpp::QoS qos(10);
+  qos.reliable().transient_local();
+
+  RealtimePublisher<StringMsg> rt_pub(node, "~/rt_publish", qos);
+  verify_publisher(rt_pub, node, qos, "~/rt_publish");
+
+  rclcpp::shutdown();
+}
+
+TEST(RealtimePublisher, rt_can_try_publish_deprecated)
+{
+  rclcpp::init(0, nullptr);
+  auto node = std::make_shared<rclcpp::Node>("construct_move_destruct_deprecated");
+  rclcpp::QoS qos(10);
+  qos.reliable().transient_local();
+  auto pub = node->create_publisher<StringMsg>("~/rt_publish_dep", qos);
+
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+  RealtimePublisher<StringMsg> rt_pub(pub);
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+
+  verify_publisher(rt_pub, node, qos, "~/rt_publish_dep");
+
+  rclcpp::shutdown();
+}
